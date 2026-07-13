@@ -48,6 +48,17 @@ macOS requires Accessibility access to list windows and intercept ⌘Tab:
 
 **System Settings → General → Login Items** → click **+** → select `/Applications/Riffle.app`.
 
+## Updating
+
+Riffle updates itself from [GitHub Releases](https://github.com/aminaryan80/riffle/releases) — no package manager needed.
+
+- **Menu bar icon → Check for Updates…** compares the running version against the latest release and reports the result.
+- A silent check also runs a few seconds after each launch; it only speaks up when a newer release exists.
+
+When an update is available, Riffle downloads the release's app zip, shows a progress window, then replaces `/Applications/Riffle.app` (or wherever it's installed) and relaunches — all in-app.
+
+> **Accessibility re-grant after updating:** Riffle is ad-hoc code-signed, so every build has a different signature and macOS treats an update as a new app for permission purposes. The updater clears the stale Accessibility grant on your behalf (`tccutil reset Accessibility com.amin.riffle`), so after it relaunches you'll need to re-enable **Riffle** once in **System Settings → Privacy & Security → Accessibility**. This is the same reason `install.sh` resets the grant.
+
 ## Usage
 
 | Action | Keys |
@@ -148,12 +159,35 @@ Sources/Riffle/
   PrivateAX.swift                   private accessibility APIs for windows in other Spaces
   SwitcherController.swift          trigger → cycle → commit/cancel state machine
   SwitcherPanel.swift               the floating icon+title list UI
+  Updater.swift                     in-app updater (GitHub Releases): check, download, swap, relaunch
 Resources/Info.plist                app bundle metadata (menu-bar-only app)
 Resources/Riffle.icns               app icon
 Tools/GenerateIcon.swift            regenerates the app icon (see below)
 build.sh                            compile + assemble + sign dist/Riffle.app
 install.sh                          build + install to /Applications + launch
 ```
+
+### Publishing a release (for maintainers)
+
+The in-app updater reads the repo's **latest** GitHub release, compares its tag against the app's `CFBundleShortVersionString`, and downloads the release's `.zip` asset. To ship an update:
+
+1. Bump the version in `Resources/Info.plist` (both `CFBundleShortVersionString` and `CFBundleVersion`), e.g. to `1.1`.
+2. Build — this now also produces the release zip:
+
+```bash
+./build.sh
+# → dist/Riffle.app  and  dist/Riffle-1.1.zip
+```
+
+3. Create a GitHub release whose **tag matches the version** and attach the zip as an asset:
+
+```bash
+gh release create v1.1 dist/Riffle-1.1.zip \
+  --title "Riffle 1.1" \
+  --notes "What changed in this release."
+```
+
+The updater strips a leading `v`, so tags like `v1.1` or `1.1` both work. The release notes (`body`) are shown in the update prompt. Any newer release that has **no `.zip` asset** falls back to just opening the release page.
 
 ### Regenerating the icon
 

@@ -30,6 +30,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             promptForAccessibility()
         }
+
+        // Delay the silent update check so it never competes with the first-run
+        // Accessibility prompt for the user's attention.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+            Updater.checkForUpdatesInBackground()
+        }
     }
 
     // MARK: - Secure Keyboard Entry detection
@@ -198,6 +204,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
         settingsItem.target = self
         menu.addItem(settingsItem)
+
+        let updatesItem = NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
+        updatesItem.target = self
+        menu.addItem(updatesItem)
+
         menu.addItem(.separator())
         let quitItem = NSMenuItem(title: "Quit Riffle", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quitItem.target = NSApp
@@ -207,5 +218,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openSettings() {
         settings.show()
+    }
+
+    @objc private func checkForUpdates() {
+        Updater.checkForUpdates()
     }
 }

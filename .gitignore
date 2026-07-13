@@ -1,1 +1,19 @@
-.build
+# Swift Package Manager build output
+.build/
+.swiftpm/
+Package.resolved
+
+# Assembled app bundle (produced by build.sh) and icon-generation scratch dir
+dist/*
+build
+
+# Xcode / editor artifacts
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# macOS
+.DS_Store
+
+# Local tool settings (machine-specific paths)
+.claude/settings.local.json
