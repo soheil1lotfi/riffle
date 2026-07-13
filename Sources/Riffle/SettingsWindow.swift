@@ -1,0 +1,384 @@
+import AppKit
+
+/// The Settings window: edit/add/remove shortcuts (with live key recording),
+/// choose what each shortcut shows, and manage the excluded-apps list.
+final class SettingsWindowController: NSObject, NSWindowDelegate {
+    private weak var appDelegate: AppDelegate?
+    private var window: NSWindow?
+
+    private let bindingsStack = NSStackView()
+    private let excludedStack = NSStackView()
+    private let addAppButton = NSPopUpButton(frame: .zero, pullsDown: true)
+
+    private var comboButtons: [NSButton] = []
+    private var recordingIndex: Int?
+
+    private static let rowWidth: CGFloat = 540
+
+    init(appDelegate: AppDelegate) {
+        self.appDelegate = appDelegate
+        super.init()
+    }
+
+    func show() {
+        if window == nil { buildWindow() }
+        reload()
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        cancelRecording()
+    }
+
+    // MARK: - Layout
+
+    private func buildWindow() {
+        let content = NSStackView()
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 8
+        content.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
+
+        content.addArrangedSubview(header("Shortcuts"))
+        content.addArrangedSubview(caption(
+            "Click a shortcut to change it, then press the new key combination. "
+            + "Shortcuts need ⌘, ⌥ or ⌃. Holding ⇧ cycles backwards. Esc cancels recording."))
+        bindingsStack.orientation = .vertical
+        bindingsStack.alignment = .leading
+        bindingsStack.spacing = 6
+        content.addArrangedSubview(bindingsStack)
+        let addShortcut = NSButton(title: "Add Shortcut", target: self, action: #selector(addShortcutTapped))
+        addShortcut.bezelStyle = .rounded
+        content.addArrangedSubview(addShortcut)
+
+        content.addArrangedSubview(spacer(12))
+        content.addArrangedSubview(header("Appearance"))
+        content.addArrangedSubview(caption(
+            "List size scales the whole switcher; it still grows for shorter lists. "
+            + "Background goes from glassy (translucent) to solid."))
+        content.addArrangedSubview(sliderRow(
+            title: "List size",
+            range: Config.listScaleRange,
+            value: Config.shared.listScale,
+            leading: "Small", trailing: "Large",
+            action: #selector(listScaleChanged(_:))))
+        content.addArrangedSubview(sliderRow(
+            title: "Background",
+            range: Config.backgroundOpacityRange,
+            value: Config.shared.backgroundOpacity,
+            leading: "Glassy", trailing: "Solid",
+            action: #selector(backgroundOpacityChanged(_:))))
+
+        content.addArrangedSubview(spacer(12))
+        content.addArrangedSubview(header("Excluded Apps"))
+        content.addArrangedSubview(caption("Windows of these apps never appear in any list."))
+        excludedStack.orientation = .vertical
+        excludedStack.alignment = .leading
+        excludedStack.spacing = 6
+        content.addArrangedSubview(excludedStack)
+        content.addArrangedSubview(addAppButton)
+        addAppButton.target = self
+        addAppButton.action = #selector(addAppSelected)
+
+        let container = NSView()
+        content.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(content)
+        NSLayoutConstraint.activate([
+            content.topAnchor.constraint(equalTo: container.topAnchor),
+            content.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor),
+            content.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            content.widthAnchor.constraint(equalToConstant: Self.rowWidth + 32),
+        ])
+
+        let win = NSWindow(
+            contentRect: .zero,
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        win.title = "Riffle Settings"
+        win.isReleasedWhenClosed = false
+        win.delegate = self
+        win.contentView = container
+        win.center()
+        window = win
+    }
+
+    private func reload() {
+        cancelRecording()
+        rebuildBindingRows()
+        rebuildExcludedRows()
+        resizeToFit()
+    }
+
+    private func resizeToFit() {
+        guard let window, let container = window.contentView,
+              let content = container.subviews.first as? NSStackView else { return }
+        content.layoutSubtreeIfNeeded()
+        let size = content.fittingSize
+        window.setContentSize(size)
+    }
+
+    // MARK: - Shortcut rows
+
+    private func rebuildBindingRows() {
+        bindingsStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        comboButtons = []
+        for (index, binding) in Config.shared.fileBindings.enumerated() {
+            let combo = NSButton(title: Config.displayString(for: binding), target: self, action: #selector(recordTapped(_:)))
+            combo.bezelStyle = .rounded
+            combo.tag = index
+            combo.widthAnchor.constraint(greaterThanOrEqualToConstant: 110).isActive = true
+            comboButtons.append(combo)
+
+            let scope = NSPopUpButton()
+            for s in Scope.allCases { scope.addItem(withTitle: s.label) }
+            if let selected = Scope.allCases.firstIndex(of: binding.scope) {
+                scope.selectItem(at: selected)
+            }
+            scope.tag = index
+            scope.target = self
+            scope.action = #selector(scopeChanged(_:))
+
+            let remove = NSButton(title: "Remove", target: self, action: #selector(removeBindingTapped(_:)))
+            remove.bezelStyle = .rounded
+            remove.tag = index
+
+            let row = NSStackView(views: [combo, scope, NSView(), remove])
+            row.orientation = .horizontal
+            row.spacing = 8
+            row.widthAnchor.constraint(equalToConstant: Self.rowWidth).isActive = true
+            bindingsStack.addArrangedSubview(row)
+        }
+    }
+
+    @objc private func recordTapped(_ sender: NSButton) {
+        cancelRecording()
+        recordingIndex = sender.tag
+        sender.title = "Type shortcut…"
+        appDelegate?.recordingHandler = { [weak self] keyCode, flags in
+            self?.captured(keyCode: keyCode, flags: flags)
+        }
+    }
+
+    private func captured(keyCode: Int64, flags: CGEventFlags) {
+        guard let index = recordingIndex else { return }
+        if keyCode == 53 { // escape cancels
+            reload()
+            return
+        }
+        guard let name = Config.keyNames[keyCode] else {
+            NSSound.beep()
+            return
+        }
+        var mods: [String] = []
+        if flags.contains(.maskCommand) { mods.append("cmd") }
+        if flags.contains(.maskAlternate) { mods.append("option") }
+        if flags.contains(.maskControl) { mods.append("ctrl") }
+        guard !mods.isEmpty else { // shift alone can't hold a switcher session
+            NSSound.beep()
+            return
+        }
+        if flags.contains(.maskShift) { mods.append("shift") }
+
+        guard Config.shared.fileBindings.indices.contains(index) else { return }
+        var binding = Config.shared.fileBindings[index]
+        binding.key = name
+        binding.modifiers = mods
+        Config.shared.updateBinding(at: index, binding)
+        reload()
+    }
+
+    private func cancelRecording() {
+        appDelegate?.recordingHandler = nil
+        if let index = recordingIndex, comboButtons.indices.contains(index),
+           Config.shared.fileBindings.indices.contains(index) {
+            comboButtons[index].title = Config.displayString(for: Config.shared.fileBindings[index])
+        }
+        recordingIndex = nil
+    }
+
+    @objc private func scopeChanged(_ sender: NSPopUpButton) {
+        let index = sender.tag
+        guard Config.shared.fileBindings.indices.contains(index),
+              Scope.allCases.indices.contains(sender.indexOfSelectedItem) else { return }
+        var binding = Config.shared.fileBindings[index]
+        binding.scope = Scope.allCases[sender.indexOfSelectedItem]
+        Config.shared.updateBinding(at: index, binding)
+    }
+
+    @objc private func removeBindingTapped(_ sender: NSButton) {
+        Config.shared.removeBinding(at: sender.tag)
+        reload()
+    }
+
+    @objc private func addShortcutTapped() {
+        Config.shared.addBinding(KeyBinding(key: "tab", modifiers: ["cmd"], scope: .activeScreen))
+        reload()
+        // Immediately record the new row so the placeholder combo isn't kept by accident.
+        if let last = comboButtons.last { recordTapped(last) }
+    }
+
+    // MARK: - Excluded apps
+
+    private func rebuildExcludedRows() {
+        excludedStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        for (index, identifier) in Config.shared.excludedApps.enumerated() {
+            let (name, icon) = Self.appInfo(for: identifier)
+            let iconView = NSImageView()
+            iconView.image = icon
+            iconView.translatesAutoresizingMaskIntoConstraints = false
+            iconView.widthAnchor.constraint(equalToConstant: 20).isActive = true
+            iconView.heightAnchor.constraint(equalToConstant: 20).isActive = true
+
+            let label = NSTextField(labelWithString: name)
+            label.lineBreakMode = .byTruncatingTail
+
+            let remove = NSButton(title: "Remove", target: self, action: #selector(removeAppTapped(_:)))
+            remove.bezelStyle = .rounded
+            remove.tag = index
+
+            let row = NSStackView(views: [iconView, label, NSView(), remove])
+            row.orientation = .horizontal
+            row.spacing = 8
+            row.widthAnchor.constraint(equalToConstant: Self.rowWidth).isActive = true
+            excludedStack.addArrangedSubview(row)
+        }
+        if Config.shared.excludedApps.isEmpty {
+            excludedStack.addArrangedSubview(caption("No apps excluded."))
+        }
+        rebuildAddAppMenu()
+    }
+
+    private func rebuildAddAppMenu() {
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "Add App…", action: nil, keyEquivalent: "")) // pull-down title
+        let excluded = Set(Config.shared.excludedApps)
+        let running = NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular }
+            .sorted { ($0.localizedName ?? "") < ($1.localizedName ?? "") }
+        for app in running {
+            let identifier = app.bundleIdentifier ?? app.localizedName ?? ""
+            guard !identifier.isEmpty, !excluded.contains(identifier) else { continue }
+            let item = NSMenuItem(title: app.localizedName ?? identifier, action: #selector(runningAppPicked(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = identifier
+            if let icon = app.icon {
+                let small = icon.copy() as! NSImage
+                small.size = NSSize(width: 16, height: 16)
+                item.image = small
+            }
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+        let other = NSMenuItem(title: "Other (choose an app)…", action: #selector(pickAppFromDisk), keyEquivalent: "")
+        other.target = self
+        menu.addItem(other)
+        addAppButton.menu = menu
+    }
+
+    @objc private func addAppSelected() {
+        // Selection handled per menu item; nothing to do here.
+    }
+
+    @objc private func runningAppPicked(_ sender: NSMenuItem) {
+        guard let identifier = sender.representedObject as? String else { return }
+        Config.shared.addExcludedApp(identifier)
+        reload()
+    }
+
+    @objc private func pickAppFromDisk() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.allowedFileTypes = ["app"]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let identifier = Bundle(url: url)?.bundleIdentifier
+            ?? url.deletingPathExtension().lastPathComponent
+        Config.shared.addExcludedApp(identifier)
+        reload()
+    }
+
+    @objc private func removeAppTapped(_ sender: NSButton) {
+        Config.shared.removeExcludedApp(at: sender.tag)
+        reload()
+    }
+
+    // MARK: - Appearance
+
+    @objc private func listScaleChanged(_ sender: NSSlider) {
+        Config.shared.setListScale(sender.doubleValue)
+    }
+
+    @objc private func backgroundOpacityChanged(_ sender: NSSlider) {
+        Config.shared.setBackgroundOpacity(sender.doubleValue)
+    }
+
+    private static func appInfo(for identifier: String) -> (String, NSImage?) {
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: identifier) {
+            let name = FileManager.default.displayName(atPath: url.path)
+            return (name, NSWorkspace.shared.icon(forFile: url.path))
+        }
+        return (identifier, NSImage(systemSymbolName: "app.dashed", accessibilityDescription: nil))
+    }
+
+    // MARK: - Small view helpers
+
+    private func header(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = .boldSystemFont(ofSize: 15)
+        return label
+    }
+
+    private func caption(_ text: String) -> NSTextField {
+        let label = NSTextField(wrappingLabelWithString: text)
+        label.font = .systemFont(ofSize: 11)
+        label.textColor = .secondaryLabelColor
+        label.preferredMaxLayoutWidth = Self.rowWidth
+        return label
+    }
+
+    private func sliderRow(
+        title: String,
+        range: ClosedRange<Double>,
+        value: Double,
+        leading: String,
+        trailing: String,
+        action: Selector
+    ) -> NSView {
+        let label = NSTextField(labelWithString: title)
+        label.widthAnchor.constraint(equalToConstant: 90).isActive = true
+
+        let leadingLabel = endcapLabel(leading)
+        let trailingLabel = endcapLabel(trailing)
+
+        let slider = NSSlider(value: value, minValue: range.lowerBound, maxValue: range.upperBound,
+                              target: self, action: action)
+        slider.isContinuous = true
+        slider.widthAnchor.constraint(greaterThanOrEqualToConstant: 240).isActive = true
+
+        let row = NSStackView(views: [label, leadingLabel, slider, trailingLabel])
+        row.orientation = .horizontal
+        row.spacing = 8
+        row.widthAnchor.constraint(equalToConstant: Self.rowWidth).isActive = true
+        return row
+    }
+
+    private func endcapLabel(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = .systemFont(ofSize: 11)
+        label.textColor = .secondaryLabelColor
+        return label
+    }
+
+    private func spacer(_ height: CGFloat) -> NSView {
+        let view = NSView()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.heightAnchor.constraint(equalToConstant: height).isActive = true
+        return view
+    }
+}
